@@ -1,0 +1,5 @@
+requests
+beautifulsoup4
+click
+tqdm
+prompt_toolkit
