@@ -94,9 +94,11 @@ def list_episodes(show_slug, season_num):
 @click.option("--all", "download_all", is_flag=True, default=False, help="Download all matching episodes")
 @click.option("--concurrency", default=3, help="Maximum concurrent downloads")
 @click.option("--dest", default=None, help="Destination base directory")
-def download(show_slug, season_num, download_all, concurrency, dest):
+@click.option("--mark-watched/--no-mark-watched", default=True, help="Mark each episode as watched on soap4.me once it finishes downloading")
+def download(show_slug, season_num, download_all, concurrency, dest, mark_watched):
     """Select episodes from a show/season, filter for subtitles and download."""
     import os
+    import threading
     from pathlib import Path
     from . import util, downloader
 
@@ -142,6 +144,7 @@ def download(show_slug, season_num, download_all, concurrency, dest):
     base_dir = Path(dest) if dest else Path.cwd() / "downloads"
     urls = []
     dest_paths = []
+    queued_episodes = []
     for e in to_download:
         click.echo(f"Resolving download links for episode S{season_num:02d}E{e['episode']:02d}...")
         links = parser.resolve_episode_download_links(session, e)
@@ -166,13 +169,31 @@ def download(show_slug, season_num, download_all, concurrency, dest):
         path.parent.mkdir(parents=True, exist_ok=True)
         urls.append(chosen["url"])
         dest_paths.append(path)
+        queued_episodes.append(e)
 
     if not urls:
         click.echo("No downloadable files found.")
         return
 
+    mark_lock = threading.Lock()
+
+    def _on_success(index, url, path):
+        if not mark_watched:
+            return
+        episode = queued_episodes[index]
+        with mark_lock:
+            try:
+                marked = parser.mark_episode_watched(session, episode)
+            except Exception as exc:
+                click.echo(f"Could not mark S{season_num:02d}E{episode['episode']:02d} as watched: {exc}")
+                return
+        if marked:
+            click.echo(f"Marked S{season_num:02d}E{episode['episode']:02d} as watched.")
+        else:
+            click.echo(f"Could not mark S{season_num:02d}E{episode['episode']:02d} as watched.")
+
     click.echo(f"Starting downloads ({len(urls)} files) with concurrency={concurrency}...")
-    results = downloader.download_files(urls, dest_paths, concurrency=concurrency)
+    results = downloader.download_files(urls, dest_paths, concurrency=concurrency, on_success=_on_success)
     for r in results:
         if r[2] is True:
             click.echo(f"Downloaded: {r[1]}")

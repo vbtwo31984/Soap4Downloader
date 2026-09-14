@@ -250,8 +250,99 @@ def _get_token_from_page(session: requests.Session, url: str) -> str:
     return ""
 
 
-def _resolve_api_play_links(session: requests.Session, play_eid: str, play_sid: str, play_hash: str, page_url: str = None) -> List[Dict]:
+def get_page_token(session: requests.Session, page_url: str = None, refresh: bool = False) -> str:
+    """Return the site API token, caching it on the session.
+
+    The token is the same for every page of a logged in session, so it is fetched
+    once and reused; pass ``refresh=True`` to force a new lookup (for example after
+    a request was rejected because the token expired).
+    """
+    if not refresh:
+        cached = getattr(session, "soap4_token", None)
+        if cached:
+            return cached
+
     token = _get_token_from_page(session, page_url or BASE_URL)
+    try:
+        session.soap4_token = token
+    except AttributeError:
+        pass
+    return token
+
+
+def _callback_headers(page_url: str = None) -> Dict[str, str]:
+    headers = {
+        "User-Agent": BROWSER_HEADERS["User-Agent"],
+        "Accept-Language": BROWSER_HEADERS["Accept-Language"],
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": BASE_URL,
+    }
+    if page_url:
+        headers["Referer"] = page_url
+    return headers
+
+
+def _callback_ok(response) -> bool:
+    if response.status_code != 200:
+        return False
+    try:
+        data = response.json()
+    except ValueError:
+        return True
+    if isinstance(data, dict):
+        if "ok" in data:
+            return bool(data["ok"])
+        if str(data.get("result", "")).lower() in ("error", "false"):
+            return False
+    return True
+
+
+def episode_eid(episode) -> str:
+    """Return the soap4.me episode id used by the /callback/ endpoint."""
+    if isinstance(episode, dict):
+        for key in ("eid", "play_eid"):
+            value = episode.get(key)
+            if value:
+                return str(value)
+        return ""
+    return str(episode or "")
+
+
+def mark_episode_watched(session: requests.Session, episode, token: str = None) -> bool:
+    """Mark a single episode as watched via the site's /callback/ endpoint.
+
+    ``episode`` is either an episode dict from :func:`list_unplayed_episodes` or a
+    bare episode id. Returns True when soap4.me accepted the callback.
+    """
+    eid = episode_eid(episode)
+    if not eid:
+        return False
+
+    page_url = (episode.get("page_url") or episode.get("url")) if isinstance(episode, dict) else None
+    callback_url = urljoin(BASE_URL, "/callback/")
+    headers = _callback_headers(page_url)
+
+    token = token or get_page_token(session, page_url)
+    if not token:
+        return False
+
+    payload = {"what": "mark_watched", "eid": eid, "token": token}
+    response = session.post(callback_url, headers=headers, data=payload)
+    if _callback_ok(response):
+        return True
+
+    # The cached token may be stale; refresh it once and retry.
+    refreshed = get_page_token(session, page_url, refresh=True)
+    if not refreshed or refreshed == token:
+        return False
+    payload["token"] = refreshed
+    return _callback_ok(session.post(callback_url, headers=headers, data=payload))
+
+
+def _resolve_api_play_links(session: requests.Session, play_eid: str, play_sid: str, play_hash: str, page_url: str = None) -> List[Dict]:
+    token = get_page_token(session, page_url)
     if not token:
         return []
     validation_hash = hashlib.md5(f"{token}{play_eid}{play_sid}{play_hash}".encode("utf-8")).hexdigest()
@@ -289,10 +380,32 @@ def _resolve_api_play_links(session: requests.Session, play_eid: str, play_sid: 
     return [{"url": stream_url, "quality": "", "ext": ext}]
 
 
+def _eid_from_card(card, *extra_tags) -> str:
+    """Find the episode id on an episode card.
+
+    Different parts of the card carry it (``data:eid`` on the card itself, on the
+    watched toggle or on the play button), so check each of them in turn.
+    """
+    for tag in (card,) + tuple(extra_tags):
+        if tag is None:
+            continue
+        for attr in ("data:eid", "data-eid", "data:id"):
+            value = tag.get(attr)
+            if value and str(value).strip():
+                return str(value).strip()
+
+    for tag in card.find_all(attrs={"data:eid": True}):
+        value = tag.get("data:eid")
+        if value and str(value).strip():
+            return str(value).strip()
+
+    return ""
+
+
 def list_unplayed_episodes(session: requests.Session, show_slug: str, season_num: int) -> List[Dict]:
     """List unplayed episodes for a given show/season using episode card metadata.
 
-    Returns list of {"episode": int, "title": str, "url": str, "download_url": str, "has_subtitles": bool, "subtitle_is_russian": bool, "qualities": [str], "quality": str, "play_eid": str}
+    Returns list of {"episode": int, "title": str, "url": str, "download_url": str, "has_subtitles": bool, "subtitle_is_russian": bool, "qualities": [str], "quality": str, "eid": str, "play_eid": str}
     """
     url = f"{BASE_URL}/soap/{show_slug}/{season_num}/"
     r = session.get(url, headers=_browser_headers())
@@ -327,7 +440,7 @@ def list_unplayed_episodes(session: requests.Session, show_slug: str, season_num
         if ep_num is None:
             continue
 
-        watched_div = card.select_one(".episode-watched div")
+        watched_div = card.select_one(".episode-watched div") or card.select_one(".episode-watched")
         is_watched = False
         if watched_div is not None:
             data_watched = watched_div.get("data:watched")
@@ -369,6 +482,8 @@ def list_unplayed_episodes(session: requests.Session, show_slug: str, season_num
         play_hash = play_tag.get("data:hash") if play_tag is not None else None
         play_episode = play_tag.get("data:episode") if play_tag is not None else None
 
+        eid = _eid_from_card(card, watched_div, play_tag) or (str(play_eid) if play_eid else "")
+
         supports_stream_api = bool(play_eid and play_sid and play_hash)
         download_source = "stream-api" if supports_stream_api else ("torrent" if download_url else "unknown")
 
@@ -384,6 +499,7 @@ def list_unplayed_episodes(session: requests.Session, show_slug: str, season_num
             "subtitle_is_russian": subtitle_is_russian,
             "qualities": qualities,
             "quality": quality_text,
+            "eid": eid,
             "play_eid": play_eid,
             "play_sid": play_sid,
             "play_hash": play_hash,

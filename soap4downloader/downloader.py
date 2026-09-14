@@ -25,15 +25,35 @@ def _download_one(url, dest_path, session=None, retries=3, chunk_size=DEFAULT_CH
             last_exc = e
     raise last_exc
 
-def download_files(urls, dest_paths, concurrency=3, chunk_size=DEFAULT_CHUNK_SIZE):
+def download_files(urls, dest_paths, concurrency=3, chunk_size=DEFAULT_CHUNK_SIZE, on_success=None, on_failure=None):
+    """Download `urls` to `dest_paths` concurrently.
+
+    `on_success(index, url, dest_path)` is called as soon as a file finishes, and
+    `on_failure(index, url, dest_path, error)` when one fails for good; both are
+    called from the worker thread so follow-up work (such as marking an episode
+    watched) happens per episode rather than after the whole batch.
+    """
     results = []
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
-        futures = {ex.submit(_download_one, u, p, None, 3, chunk_size): (u, p) for u, p in zip(urls, dest_paths)}
+        futures = {
+            ex.submit(_download_one, u, p, None, 3, chunk_size): (i, u, p)
+            for i, (u, p) in enumerate(zip(urls, dest_paths))
+        }
         for fut in as_completed(futures):
-            u, p = futures[fut]
+            i, u, p = futures[fut]
             try:
                 fut.result()
                 results.append((u, p, True))
+                if on_success is not None:
+                    try:
+                        on_success(i, u, p)
+                    except Exception:
+                        pass
             except Exception as e:
                 results.append((u, p, False, str(e)))
+                if on_failure is not None:
+                    try:
+                        on_failure(i, u, p, e)
+                    except Exception:
+                        pass
     return results
