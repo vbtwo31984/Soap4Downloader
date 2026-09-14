@@ -16,3 +16,6 @@ Run:
 python -m soap4downloader login
 python -m soap4downloader list-new
 ```
+
+Each episode is marked as watched on soap4.me as soon as its download finishes.
+Pass `--no-mark-watched` to `download` to skip that.

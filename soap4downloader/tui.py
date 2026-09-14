@@ -6,6 +6,7 @@ from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.layout import Layout
 from . import session_manager, parser, downloader, util
 from pathlib import Path
+import threading
 
 
 def _message(title, text):
@@ -200,6 +201,7 @@ def run_tui():
     # resolve links and download
     urls = []
     dest_paths = []
+    queued_episodes = []
     for e in to_download:
         links = parser.resolve_episode_download_links(session, e)
         if not links:
@@ -223,6 +225,7 @@ def run_tui():
         path.parent.mkdir(parents=True, exist_ok=True)
         urls.append(chosen['url'])
         dest_paths.append(path)
+        queued_episodes.append(e)
 
     if not urls:
         _message("Nothing to download", "No files to download.")
@@ -240,6 +243,22 @@ def run_tui():
     if concurrency is None:
         return
 
+    mark_lock = threading.Lock()
+
+    def _on_success(index, url, path):
+        episode = queued_episodes[index]
+        label = f"S{season_num:02d}E{episode['episode']:02d}"
+        with mark_lock:
+            try:
+                marked = parser.mark_episode_watched(session, episode)
+            except Exception as exc:
+                print(f"\nCould not mark {label} as watched: {exc}")
+                return
+        if marked:
+            print(f"\nMarked {label} as watched.")
+        else:
+            print(f"\nCould not mark {label} as watched.")
+
     print(f"\nStarting {len(urls)} downloads (concurrency={concurrency}).")
-    downloader.download_files(urls, dest_paths, concurrency=concurrency)
+    downloader.download_files(urls, dest_paths, concurrency=concurrency, on_success=_on_success)
     _message("Done", "Downloads finished.")
